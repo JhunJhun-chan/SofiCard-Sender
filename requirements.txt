@@ -1,0 +1,4 @@
+PyAutoGUI
+Pyperclip
+keyboard
+PyGetWindow
