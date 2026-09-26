@@ -1,0 +1,33 @@
+{
+  "startup_delay": 10.0,
+
+  "pre_paste_min": 4.0,
+  "pre_paste_max": 7.0,
+  "post_paste_min": 3.0,
+  "post_paste_max": 6.0,
+
+
+  "channel_cooldown": 10.0,
+  "cooldown_jitter_min": 2.0,
+  "cooldown_jitter_max": 7.0,
+
+  "think_chance": 0.25,
+  "think_min": 3.0,
+  "think_max": 10.0,
+
+  "break_every_min": 8,
+  "break_every_max": 15,
+  "break_duration_min": 30.0,
+  "break_duration_max": 90.0,
+
+  "review_chance": 0.15,
+  "review_min": 1.5,
+  "review_max": 4.0,
+
+  "log_max_lines": 500,
+  "clear_log_on_exit": true,
+
+  "require_discord_focus": true,
+  "restore_clipboard": true,
+  "code_pattern": "[a-zA-Z0-9]{5,8}"
+}
