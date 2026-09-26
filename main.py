@@ -1,5 +1,5 @@
 """
-Discord bulk card sender with humanised pacing.
+Discord bulk card sender with configurable pacing and persistent recovery.
 
 Reads codes from data/remaining.txt (or prompts for paste), sends
 `sv <code>` into the focused Discord window, and tracks progress in
@@ -79,6 +79,7 @@ SENT_FILE = DATA_FOLDER / "sent.txt"
 REMAINING_FILE = DATA_FOLDER / "remaining.txt"
 LOG_FILE = DATA_FOLDER / "log.txt"
 LOCK_FILE = DATA_FOLDER / ".lock"
+INFLIGHT_FILE = DATA_FOLDER / "inflight.txt"
 
 DEFAULT_CONFIG = {
     # Startup
@@ -204,14 +205,72 @@ def append_line_rotated(path: Path, line: str, max_lines: int) -> None:
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
+def validate_config(cfg: dict) -> None:
+    """Validate configuration values and raise a clear error for invalid settings."""
+    non_negative = (
+        "startup_delay",
+        "pre_paste_min",
+        "pre_paste_max",
+        "post_paste_min",
+        "post_paste_max",
+        "channel_cooldown",
+        "cooldown_jitter_min",
+        "cooldown_jitter_max",
+        "think_min",
+        "think_max",
+        "break_duration_min",
+        "break_duration_max",
+        "review_min",
+        "review_max",
+    )
+    for key in non_negative:
+        value = cfg[key]
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or value < 0:
+            raise ValueError(f"{key} must be a non-negative number")
+
+    for key in ("think_chance", "review_chance"):
+        value = cfg[key]
+        if not isinstance(value, (int, float)) or isinstance(value, bool) or not 0 <= value <= 1:
+            raise ValueError(f"{key} must be a number between 0 and 1")
+
+    for key in ("break_every_min", "break_every_max", "log_max_lines"):
+        value = cfg[key]
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise ValueError(f"{key} must be a non-negative integer")
+
+    if cfg["break_every_min"] > cfg["break_every_max"]:
+        raise ValueError("break_every_min cannot be greater than break_every_max")
+
+    if not isinstance(cfg["require_discord_focus"], bool):
+        raise ValueError("require_discord_focus must be true or false")
+
+    if not isinstance(cfg["restore_clipboard"], bool):
+        raise ValueError("restore_clipboard must be true or false")
+
+    if not isinstance(cfg["clear_log_on_exit"], bool):
+        raise ValueError("clear_log_on_exit must be true or false")
+
+    if not isinstance(cfg["code_pattern"], str) or not cfg["code_pattern"]:
+        raise ValueError("code_pattern must be a non-empty regular expression")
+
+    try:
+        re.compile(cfg["code_pattern"])
+    except re.error as exc:
+        raise ValueError(f"code_pattern is invalid: {exc}") from exc
+
+
 def load_config(path: Path) -> dict:
     cfg = dict(DEFAULT_CONFIG)
     if path.exists():
         try:
             user_cfg = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(user_cfg, dict):
+                raise ValueError("config.json must contain a JSON object")
             cfg.update(user_cfg)
         except json.JSONDecodeError as e:
-            log.warning("config.json is invalid JSON (%s); using defaults", e)
+            raise ValueError(f"config.json is invalid JSON: {e}") from e
+
+    validate_config(cfg)
     return cfg
 
 
@@ -275,7 +334,11 @@ def humanized_wait(cfg: dict, cards_since_break: int) -> int:
 
 
 def human_press_enter(cfg: dict) -> None:
-    """Press Enter (no review pause)."""
+    """Optionally pause before pressing Enter, then press Enter."""
+    if random.random() < cfg["review_chance"]:
+        review = random.uniform(cfg["review_min"], cfg["review_max"])
+        log.info("Review pause: %.1fs", review)
+        time.sleep(review)
     pyautogui.press("enter")
 
 
@@ -301,18 +364,31 @@ class InstanceLock:
 
     def __enter__(self):
         DATA_FOLDER.mkdir(parents=True, exist_ok=True)
-        if self.path.exists():
+        pid_text = str(os.getpid())
+
+        for _ in range(2):
             try:
-                pid = int(self.path.read_text().strip())
-                if _pid_alive(pid):
+                with self.path.open("x", encoding="utf-8") as f:
+                    f.write(pid_text)
+                return self
+            except FileExistsError:
+                try:
+                    existing_pid = int(self.path.read_text(encoding="utf-8").strip())
+                except (OSError, ValueError):
+                    existing_pid = 0
+
+                if existing_pid and _pid_alive(existing_pid):
                     raise SystemExit(
-                        f"Another instance is already running (PID {pid}). "
-                        f"Remove {self.path} if this is stale."
+                        f"Another instance is already running (PID {existing_pid})."
                     )
-            except ValueError:
-                pass
-        self.path.write_text(str(os.getpid()))
-        return self
+
+                # The lock is stale. Remove it and retry atomic creation.
+                try:
+                    self.path.unlink()
+                except FileNotFoundError:
+                    pass
+
+        raise SystemExit("Could not acquire the instance lock safely.")
 
     def __exit__(self, *exc):
         try:
@@ -381,10 +457,17 @@ class Control:
 # ---------------------------------------------------------------------------
 # Input collection
 # ---------------------------------------------------------------------------
-def collect_codes_if_needed(cfg: dict, sent: set[str]) -> list[str]:
-    """If remaining.txt is empty, prompt the user to paste and parse."""
-    remaining = load_lines(REMAINING_FILE)
+def collect_codes_if_needed(
+    cfg: dict,
+    sent: set[str],
+    *,
+    persist: bool = True,
+) -> list[str]:
+    """Load remaining codes or prompt for input, optionally persisting new input."""
+    remaining = [code for code in load_lines(REMAINING_FILE) if code not in sent]
     if remaining:
+        if persist:
+            atomic_write(REMAINING_FILE, "\n".join(remaining))
         return remaining
 
     print("\nPaste your entire Sofi page below.")
@@ -403,8 +486,9 @@ def collect_codes_if_needed(cfg: dict, sent: set[str]) -> list[str]:
     raw = "\n".join(lines)
     codes = parse_codes(raw, sent, cfg["code_pattern"])
 
-    if codes:
+    if persist and codes:
         atomic_write(REMAINING_FILE, "\n".join(codes))
+
     return codes
 
 
@@ -422,19 +506,85 @@ def send_card(code: str, cfg: dict) -> None:
         except Exception:
             prev_clipboard = None
 
-    pyperclip.copy(command)
+    try:
+        pyperclip.copy(command)
 
-    rand_delay(cfg["pre_paste_min"], cfg["pre_paste_max"], "before pasting")
-    pyautogui.hotkey("ctrl", "v")
+        rand_delay(cfg["pre_paste_min"], cfg["pre_paste_max"], "before pasting")
+        pyautogui.hotkey("ctrl", "v")
 
-    rand_delay(cfg["post_paste_min"], cfg["post_paste_max"], "before pressing Enter")
-    human_press_enter(cfg)
+        rand_delay(
+            cfg["post_paste_min"],
+            cfg["post_paste_max"],
+            "before pressing Enter",
+        )
+        human_press_enter(cfg)
+    finally:
+        if prev_clipboard is not None:
+            try:
+                pyperclip.copy(prev_clipboard)
+            except Exception as exc:
+                log.warning("Could not restore clipboard: %s", exc)
 
-    if prev_clipboard is not None:
-        try:
-            pyperclip.copy(prev_clipboard)
-        except Exception:
-            pass
+
+# ---------------------------------------------------------------------------
+# Recovery
+# ---------------------------------------------------------------------------
+def load_inflight() -> Optional[str]:
+    """Return the code recorded as in-flight, if any."""
+    lines = load_lines(INFLIGHT_FILE)
+    return lines[0] if lines else None
+
+
+def clear_inflight() -> None:
+    """Remove the in-flight marker."""
+    try:
+        INFLIGHT_FILE.unlink(missing_ok=True)
+    except OSError as exc:
+        log.warning("Could not clear in-flight state: %s", exc)
+
+
+def recover_inflight(sent_codes: set[str]) -> None:
+    """
+    Handle a code left in the in-flight marker after an interrupted run.
+
+    If the code is already in sent.txt, the marker is stale and can be cleared.
+    Otherwise ask the user whether to mark it sent or retry it.
+    """
+    code = load_inflight()
+    if not code:
+        return
+
+    if code in sent_codes:
+        log.info("Clearing stale in-flight marker for already-sent code %s.", code)
+        clear_inflight()
+        return
+
+    print(
+        "\nA previous run was interrupted while processing this code:\n"
+        f"    sv {code}\n"
+        "The command may or may not have reached Discord."
+    )
+    while True:
+        choice = input(
+            "Choose [m]ark as sent, [r]etry it, or [c]ancel: "
+        ).strip().lower()
+
+        if choice == "m":
+            append_line(SENT_FILE, code)
+            sent_codes.add(code)
+            clear_inflight()
+            log.warning("Marked in-flight code as sent: %s", code)
+            return
+
+        if choice == "r":
+            clear_inflight()
+            log.warning("Retrying in-flight code: %s", code)
+            return
+
+        if choice == "c":
+            raise SystemExit("Recovery cancelled by user.")
+
+        print("Please enter m, r, or c.")
 
 
 # ---------------------------------------------------------------------------
@@ -442,14 +592,25 @@ def send_card(code: str, cfg: dict) -> None:
 # ---------------------------------------------------------------------------
 def main() -> int:
     parser = argparse.ArgumentParser(description="Discord bulk card sender.")
-    parser.add_argument("--config", default="config.json",
-                        help="path to config file")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="parse and print codes without sending")
+    parser.add_argument(
+        "--config",
+        default="config.json",
+        help="path to config file",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="parse and print codes without sending or changing runtime state",
+    )
     args = parser.parse_args()
 
     setup_logging()
-    cfg = load_config(Path(args.config))
+
+    try:
+        cfg = load_config(Path(args.config))
+    except ValueError as exc:
+        log.error("Configuration error: %s", exc)
+        return 2
 
     pyautogui.PAUSE = 0.05
     pyautogui.FAILSAFE = True  # move mouse to a corner to abort
@@ -460,10 +621,35 @@ def main() -> int:
     try:
         with InstanceLock(LOCK_FILE):
             sent_codes = set(load_lines(SENT_FILE))
-            remaining = collect_codes_if_needed(cfg, sent_codes)
+
+            # Dry-run is deliberately read-only with respect to runtime state.
+            remaining = collect_codes_if_needed(
+                cfg,
+                sent_codes,
+                persist=not args.dry_run,
+            )
 
             if not remaining:
-                log.info("No cards to send.")
+                log.info("No cards to process.")
+                clean_exit = True
+                return 0
+
+            if args.dry_run:
+                log.info("Dry run: %d code(s) would be processed.", len(remaining))
+                for code in remaining:
+                    log.info("[dry-run] would send: sv %s", code)
+                clean_exit = True
+                return 0
+
+            # Resolve any previous interrupted operation before continuing.
+            recover_inflight(sent_codes)
+
+            # Remove anything that became sent during recovery.
+            remaining = [code for code in remaining if code not in sent_codes]
+            atomic_write(REMAINING_FILE, "\n".join(remaining))
+
+            if not remaining:
+                log.info("No unsent cards remain after recovery.")
                 clean_exit = True
                 return 0
 
@@ -474,21 +660,12 @@ def main() -> int:
 
             log.info("Loaded %d cards.", total)
 
-            if args.dry_run:
-                for code in remaining:
-                    log.info("[dry-run] would send: sv %s", code)
-                clean_exit = True
-                return 0
-
             print("Switch to the Discord channel now.")
             print(f"Starting in {cfg['startup_delay']:.1f}s...\n")
             time.sleep(cfg["startup_delay"])
 
             control = Control()
             control.register()
-
-            # Persist the (possibly reduced) remaining list up front.
-            atomic_write(REMAINING_FILE, "\n".join(remaining))
 
             try:
                 while control.running:
@@ -506,7 +683,10 @@ def main() -> int:
 
                     code = remaining[0]
 
-                    # Log intent first (crash-safe, rotated).
+                    # Record intent before GUI automation. If the process crashes
+                    # during send_card(), the next startup can request recovery.
+                    atomic_write(INFLIGHT_FILE, code)
+
                     append_line_rotated(
                         LOG_FILE,
                         f"{time.strftime('%Y-%m-%d %H:%M:%S')} -> sv {code}",
@@ -515,25 +695,35 @@ def main() -> int:
 
                     send_card(code, cfg)
 
-                    # Mark sent. sent.txt is NEVER rotated/cleared.
+                    # A successful return from send_card() means the local
+                    # automation completed. Persist completion before clearing
+                    # the in-flight marker.
                     append_line(SENT_FILE, code)
                     completed += 1
 
-                    # Persist remaining.
                     remaining.pop(0)
                     atomic_write(REMAINING_FILE, "\n".join(remaining))
+                    clear_inflight()
 
                     elapsed = time.monotonic() - start
                     avg = elapsed / completed
                     eta = avg * len(remaining)
+
                     log.info(
                         "[%d/%d] sent sv %s | avg %.1fs/card | ETA %.1f min",
-                        completed, total, code, avg, eta / 60.0,
+                        completed,
+                        total,
+                        code,
+                        avg,
+                        eta / 60.0,
                     )
 
                     if remaining:
                         cards_since_break += 1
-                        cards_since_break = humanized_wait(cfg, cards_since_break)
+                        cards_since_break = humanized_wait(
+                            cfg,
+                            cards_since_break,
+                        )
 
             except KeyboardInterrupt:
                 log.info("Interrupted by user.")
@@ -547,7 +737,11 @@ def main() -> int:
             runtime = time.monotonic() - start
             log.info("=" * 40)
             log.info("Completed : %d", completed)
-            log.info("Runtime   : %dm %ds", int(runtime // 60), int(runtime % 60))
+            log.info(
+                "Runtime   : %dm %ds",
+                int(runtime // 60),
+                int(runtime % 60),
+            )
             if completed:
                 log.info("Average   : %.1fs/card", runtime / completed)
             log.info("=" * 40)
@@ -555,8 +749,6 @@ def main() -> int:
             clean_exit = True
 
     finally:
-        # Only clear the log if we exited cleanly (finished, F9, Ctrl+C,
-        # or failsafe). On a crash / unhandled exception, we keep it.
         if clean_exit and cfg.get("clear_log_on_exit"):
             shutdown_logging_and_clear()
 
