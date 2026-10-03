@@ -17,8 +17,8 @@
 
   "break_every_min": 8,
   "break_every_max": 15,
-  "break_duration_min": 30.0,
-  "break_duration_max": 90.0,
+  "break_duration_min": 10.0,
+  "break_duration_max": 20.0,
 
   "review_chance": 0.15,
   "review_min": 1.5,
